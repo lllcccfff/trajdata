@@ -1,4 +1,4 @@
-from typing import Any, Dict, Final, List, Tuple, Union
+from typing import Any, Dict, Final, List, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -7,6 +7,7 @@ from nuscenes.map_expansion.map_api import NuScenesMap
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 from scipy.spatial.distance import cdist
+from shapely.geometry import Point, Polygon
 from tqdm import tqdm
 
 from trajdata.data_structures import Agent, AgentMetadata, AgentType, FixedExtent, Scene
@@ -16,6 +17,7 @@ from trajdata.maps.vec_map_elements import (
     PedCrosswalk,
     PedWalkway,
     Polyline,
+    Road,
     RoadArea,
     RoadLane,
 )
@@ -371,6 +373,241 @@ def extract_area(nusc_map: NuScenesMap, area_record) -> np.ndarray:
     return np.array([(node["x"], node["y"]) for node in polygon_nodes])
 
 
+def _lane_center_midpoint(nusc_map: NuScenesMap, lane_id: str) -> np.ndarray:
+    center = np.asarray(
+        arcline_path_utils.discretize_lane(
+            nusc_map.arcline_path_3.get(lane_id, []), 1.0
+        )
+    )
+    return center[len(center) // 2]
+
+
+def _assign_lanes_to_roads(nusc_map: NuScenesMap, lane_ids: Set[str]) -> Dict[str, str]:
+    lane_to_road = {}
+    for lane_id in lane_ids:
+        mid = _lane_center_midpoint(nusc_map, lane_id)
+        road_id = nusc_map.record_on_point(float(mid[0]), float(mid[1]), "road_block")
+        if road_id != "":
+            lane_to_road[lane_id] = road_id
+    return lane_to_road
+
+
+def _assign_lane_connectors_to_roads(
+    nusc_map: NuScenesMap, lane_connector_ids: Set[str], road_segment_ids: Set[str]
+) -> Dict[str, str]:
+    road_segment_polygons = {
+        road_id: Polygon(extract_area(nusc_map, nusc_map.get("road_segment", road_id)))
+        for road_id in road_segment_ids
+    }
+
+    lane_to_road = {}
+    for lane_id in lane_connector_ids:
+        center = np.asarray(
+            arcline_path_utils.discretize_lane(
+                nusc_map.arcline_path_3.get(lane_id, []), 1.0
+            )
+        )
+        road_votes: Dict[str, int] = {}
+        for point_xy in center[:, :2]:
+            point = Point(float(point_xy[0]), float(point_xy[1]))
+            for road_id, polygon in road_segment_polygons.items():
+                if polygon.intersects(point):
+                    road_votes[road_id] = road_votes.get(road_id, 0) + 1
+
+        road_id = max(road_votes, key=road_votes.__getitem__)
+        lane_to_road[lane_id] = road_id
+    return lane_to_road
+
+
+def _road_successors_from_lanes(
+    vector_map: VectorMap, lane_to_road: Dict[str, str]
+) -> Dict[str, Set[str]]:
+    road_successors: Dict[str, Set[str]] = {}
+    vector_lane_ids = set(vector_map.elements[MapElementType.ROAD_LANE].keys())
+    for lane_id, road_id in lane_to_road.items():
+        lane = vector_map.get_road_lane(lane_id)
+        for next_lane_id in lane.next_lanes:
+            if next_lane_id not in vector_lane_ids:
+                continue
+            next_road_id = lane_to_road[next_lane_id]
+            if next_road_id != road_id:
+                road_successors.setdefault(road_id, set()).add(next_road_id)
+    return road_successors
+
+
+def _lane_divider_node_key(lane_record: dict, side: str) -> Tuple[str, ...]:
+    return tuple(
+        segment["node_token"]
+        for segment in lane_record[f"{side}_lane_divider_segments"]
+    )
+
+
+def _add_lane_adjacency_within_roads(
+    vector_map: VectorMap, nusc_map: NuScenesMap
+) -> None:
+    lane_records = {lane_record["token"]: lane_record for lane_record in nusc_map.lane}
+    left_divider_to_lanes: Dict[Tuple[str, ...], List[str]] = {}
+    right_divider_to_lanes: Dict[Tuple[str, ...], List[str]] = {}
+    for lane_record in lane_records.values():
+        lane_id = lane_record["token"]
+        left_key = _lane_divider_node_key(lane_record, "left")
+        right_key = _lane_divider_node_key(lane_record, "right")
+        if left_key:
+            left_divider_to_lanes.setdefault(left_key, []).append(lane_id)
+        if right_key:
+            right_divider_to_lanes.setdefault(right_key, []).append(lane_id)
+
+    for road in vector_map.elements[MapElementType.ROAD].values():
+        road_lane_ids = set(road.lane_ids)
+        for lane_id in road_lane_ids.intersection(lane_records):
+            lane_record = lane_records[lane_id]
+            lane = vector_map.get_road_lane(lane_id)
+
+            left_key = _lane_divider_node_key(lane_record, "left")
+            if left_key:
+                lane.adj_lanes_left.update(
+                    candidate_id
+                    for candidate_id in right_divider_to_lanes.get(left_key, [])
+                    if candidate_id in road_lane_ids and candidate_id != lane_id
+                )
+
+            right_key = _lane_divider_node_key(lane_record, "right")
+            if right_key:
+                lane.adj_lanes_right.update(
+                    candidate_id
+                    for candidate_id in left_divider_to_lanes.get(right_key, [])
+                    if candidate_id in road_lane_ids and candidate_id != lane_id
+                )
+
+
+def add_nusc_road_topology(
+    vector_map: VectorMap, nusc_map: NuScenesMap
+) -> None:
+    """Adds NuScenes road topology to an already lane-populated VectorMap."""
+    lane_ids = set(vector_map.elements[MapElementType.ROAD_LANE].keys())
+    lane_layer_ids = {
+        lane_record["token"]
+        for lane_record in nusc_map.lane
+        if lane_record["token"] in lane_ids
+    }
+    lane_connector_layer_ids = {
+        lane_record["token"]
+        for lane_record in nusc_map.lane_connector
+        if lane_record["token"] in lane_ids
+    }
+    road_segment_ids = {
+        road_record["token"]
+        for road_record in nusc_map.road_segment
+        if road_record["is_intersection"]
+    }
+    road_ids = {road_record["token"] for road_record in nusc_map.road_block}
+    road_ids.update(road_segment_ids)
+
+    lane_to_road = _assign_lanes_to_roads(nusc_map, lane_layer_ids)
+    lane_to_road.update(
+        _assign_lane_connectors_to_roads(
+            nusc_map, lane_connector_layer_ids, road_segment_ids
+        )
+    )
+    missing_lane_ids = lane_ids.difference(lane_to_road)
+    if missing_lane_ids:
+        raise RuntimeError(
+            f"NuScenes road topology did not cover {len(missing_lane_ids)} lanes "
+            f"in map {vector_map.map_id}."
+        )
+
+    road_to_lanes: Dict[str, Set[str]] = {}
+    for lane_id, road_id in lane_to_road.items():
+        road_to_lanes.setdefault(road_id, set()).add(lane_id)
+
+    road_successors: Dict[str, Set[str]] = {road_id: set() for road_id in road_ids}
+    for road_id, next_road_ids in _road_successors_from_lanes(
+        vector_map, lane_to_road
+    ).items():
+        road_successors[road_id].update(next_road_ids)
+
+    vector_map.elements[MapElementType.ROAD].clear()
+    vector_map.lane_to_road.clear()
+    vector_map.roads = None
+
+    for road_record in nusc_map.road_block:
+        road_id = road_record["token"]
+        _add_nusc_road_area(vector_map, nusc_map, road_record)
+        vector_map.add_map_element(
+            Road(
+                id=road_id,
+                road_area_id=road_id,
+                lane_ids=road_to_lanes.get(road_id, set()),
+                next_roads=road_successors[road_id],
+            )
+        )
+
+    for road_record in nusc_map.road_segment:
+        if not road_record["is_intersection"]:
+            continue
+        road_id = road_record["token"]
+        _add_nusc_road_area(vector_map, nusc_map, road_record)
+        vector_map.add_map_element(
+            Road(
+                id=road_id,
+                road_area_id=road_id,
+                lane_ids=road_to_lanes.get(road_id, set()),
+                next_roads=road_successors[road_id],
+            )
+        )
+
+    for road in vector_map.elements[MapElementType.ROAD].values():
+        road.prev_roads.clear()
+    for road in vector_map.elements[MapElementType.ROAD].values():
+        for next_road_id in road.next_roads:
+            next_road = vector_map.elements[MapElementType.ROAD].get(next_road_id)
+            if next_road is not None:
+                next_road.prev_roads.add(road.id)
+
+    _add_lane_adjacency_within_roads(vector_map, nusc_map)
+
+
+def _connector_edges_from_center(center_pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    headings = map_utils.get_polyline_headings(center_pts)[:, 0]
+    normal = np.stack([-np.sin(headings), np.cos(headings)], axis=1)
+    left_pts = center_pts + normal * 2.0
+    right_pts = center_pts - normal * 2.0
+    return left_pts, right_pts
+
+
+def _add_nusc_lane_connector(
+    vector_map: VectorMap, nusc_map: NuScenesMap, lane_record: dict
+) -> None:
+    lane_record_token: str = lane_record["token"]
+    center_pts = extract_lane_center(nusc_map, lane_record)
+    left_pts, right_pts = _connector_edges_from_center(center_pts)
+    new_lane = RoadLane(
+        id=lane_record_token,
+        center=Polyline(center_pts),
+        left_edge=Polyline(left_pts),
+        right_edge=Polyline(right_pts),
+    )
+
+    new_lane.prev_lanes.update(nusc_map.get_incoming_lane_ids(lane_record_token))
+    new_lane.next_lanes.update(nusc_map.get_outgoing_lane_ids(lane_record_token))
+    vector_map.add_map_element(new_lane)
+
+
+def _add_nusc_road_area(
+    vector_map: VectorMap, nusc_map: NuScenesMap, road_record: dict
+) -> None:
+    road_id = road_record["token"]
+    if road_id in vector_map.elements[MapElementType.ROAD_AREA]:
+        return
+
+    polygon_pts = extract_area(nusc_map, road_record)
+    road_area = RoadArea(id=road_id, exterior_polygon=Polyline(polygon_pts))
+    for hole in road_record["holes"]:
+        hole_pts = extract_area(nusc_map, hole)
+        road_area.interior_holes.append(Polyline(hole_pts))
+    vector_map.add_map_element(road_area)
+
+
 def populate_vector_map(vector_map: VectorMap, nusc_map: NuScenesMap) -> None:
     # Setting the map bounds.
     vector_map.extent = np.array(
@@ -387,6 +624,8 @@ def populate_vector_map(vector_map: VectorMap, nusc_map: NuScenesMap) -> None:
     overall_pbar = tqdm(
         total=len(nusc_map.lane)
         + len(nusc_map.lane_connector)
+        + len(nusc_map.road_block)
+        + len(nusc_map.road_segment)
         + len(nusc_map.drivable_area)
         + len(nusc_map.ped_crossing)
         + len(nusc_map.walkway),
@@ -431,31 +670,18 @@ def populate_vector_map(vector_map: VectorMap, nusc_map: NuScenesMap) -> None:
         overall_pbar.update()
 
     for lane_record in nusc_map.lane_connector:
-        # Unfortunately lane connectors in nuScenes have very simple exterior
-        # polygons which make extracting their edges quite difficult, so we
-        # only extract the centerline.
-        center_pts = extract_lane_center(nusc_map, lane_record)
+        _add_nusc_lane_connector(vector_map, nusc_map, lane_record)
+        overall_pbar.update()
 
-        lane_record_token: str = lane_record["token"]
+    add_nusc_road_topology(vector_map, nusc_map)
 
-        # Adding the element to the map.
-        new_lane = RoadLane(
-            id=lane_record_token,
-            center=Polyline(center_pts),
-        )
+    for road_record in nusc_map.road_block:
+        overall_pbar.update()
 
-        new_lane.prev_lanes.update(nusc_map.get_incoming_lane_ids(lane_record_token))
-        new_lane.next_lanes.update(nusc_map.get_outgoing_lane_ids(lane_record_token))
-
-        # new_lane.adjacent_lanes_left.append(
-        #     l5_lane.adjacent_lane_change_left.id
-        # )
-        # new_lane.adjacent_lanes_right.append(
-        #     l5_lane.adjacent_lane_change_right.id
-        # )
-
-        # Adding the element to the map.
-        vector_map.add_map_element(new_lane)
+    for road_record in nusc_map.road_segment:
+        if not road_record["is_intersection"]:
+            overall_pbar.update()
+            continue
         overall_pbar.update()
 
     for drivable_area in nusc_map.drivable_area:

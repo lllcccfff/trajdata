@@ -12,6 +12,7 @@ class MapElementType(IntEnum):
     ROAD_AREA = 2
     PED_CROSSWALK = 3
     PED_WALKWAY = 4
+    ROAD = 5
 
 
 @dataclass
@@ -157,6 +158,15 @@ class RoadArea(MapElement):
     exterior_polygon: Polyline
     interior_holes: List[Polyline] = field(default_factory=lambda: list())
     elem_type: MapElementType = MapElementType.ROAD_AREA
+
+
+@dataclass
+class Road(MapElement):
+    road_area_id: str
+    lane_ids: Set[str] = field(default_factory=lambda: set())
+    prev_roads: Set[str] = field(default_factory=lambda: set())
+    next_roads: Set[str] = field(default_factory=lambda: set())
+    elem_type: MapElementType = MapElementType.ROAD
 
 
 @dataclass

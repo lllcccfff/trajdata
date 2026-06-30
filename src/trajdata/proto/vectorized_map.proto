@@ -29,6 +29,7 @@ message MapElement {
     RoadArea road_area = 3;
     PedCrosswalk ped_crosswalk = 4;
     PedWalkway ped_walkway = 5;
+    Road road = 6;
   }
 }
 
@@ -84,6 +85,21 @@ message RoadArea {
 
   // The area within these polygons is NOT included.
   repeated Polyline interior_holes = 2;
+}
+
+message Road {
+  // The corresponding RoadArea polygon ID. Road and RoadArea should share
+  // the same ID when the source map provides one polygon per road.
+  bytes road_area = 1;
+
+  // IDs for all lanes belonging to this road, including lane connectors.
+  repeated bytes lanes = 2;
+
+  // IDs for roads that can enter this road.
+  repeated bytes entry_roads = 3;
+
+  // IDs for roads that this road can exit to.
+  repeated bytes exit_roads = 4;
 }
 
 message PedCrosswalk {

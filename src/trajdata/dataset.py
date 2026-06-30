@@ -131,7 +131,7 @@ class UnifiedDataset(Dataset):
             incl_raster_map (bool, optional): Include a local cropping of the rasterized map (if the dataset provides a map) per agent. Defaults to False.
             raster_map_params (Optional[Dict[str, Any]], optional): Local map cropping parameters, must be specified if incl_map is True. Must contain keys {"px_per_m", "map_size_px"} and can optionally contain {"offset_frac_xy"}. Defaults to None.
             incl_vector_map (bool, optional): Include information about the scene's vector map (e.g., for use in nearest lane queries as an `extras` batch element function),
-            vector_map_params (Optional[Dict[str, Any]], optional): Vector map loading parameters. Defaults to None (by default only road lanes will be loaded as part of the map).
+            vector_map_params (Optional[Dict[str, Any]], optional): Vector map loading parameters.
             require_map_cache (bool, optional): Cache map objects (if the dataset provides a map) regardless of the value of incl_map. Defaults to True.
             only_types (Optional[List[AgentType]], optional): Filter out all agents EXCEPT for those of the specified types. Defaults to None.
             only_predict (Optional[List[AgentType]], optional): Only predict the specified types of agents. Importantly, this keeps other agent types in the scene, e.g., as neighbors of the agent to be predicted. Defaults to None.
@@ -200,7 +200,8 @@ class UnifiedDataset(Dataset):
             if vector_map_params is not None
             else {
                 "incl_road_lanes": True,
-                "incl_road_areas": False,
+                "incl_road_areas": True,
+                "incl_roads": True,
                 "incl_ped_crosswalks": False,
                 "incl_ped_walkways": False,
                 # Collation can be quite slow if vector maps are included,

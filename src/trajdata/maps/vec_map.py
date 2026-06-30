@@ -37,6 +37,7 @@ from trajdata.maps.vec_map_elements import (
     PedCrosswalk,
     PedWalkway,
     Polyline,
+    Road,
     RoadArea,
     RoadLane,
 )
@@ -55,16 +56,37 @@ class VectorMap:
     search_kdtrees: Optional[Dict[MapElementType, MapElementKDTree]] = None
     search_rtrees: Optional[Dict[MapElementType, MapElementSTRTree]] = None
     traffic_light_status: Optional[Dict[Tuple[str, int], TrafficLightStatus]] = None
+    lane_query_dim: int = field(init=False)
 
     def __post_init__(self) -> None:
         self.env_name, self.map_name = self.map_id.split(":")
+        self.lane_query_dim = self._lane_query_dim_for_map_id(self.map_id)
 
         self.lanes: Optional[List[RoadLane]] = None
         if MapElementType.ROAD_LANE in self.elements:
             self.lanes = list(self.elements[MapElementType.ROAD_LANE].values())
+        self.roads: Optional[List[Road]] = None
+        self.lane_to_road: Dict[str, str] = {}
+        if MapElementType.ROAD in self.elements:
+            self.roads = list(self.elements[MapElementType.ROAD].values())
+            for road in self.roads:
+                for lane_id in road.lane_ids:
+                    self.lane_to_road[lane_id] = road.id
+
+    @staticmethod
+    def _lane_query_dim_for_map_id(map_id: str) -> int:
+        env_name, _ = map_id.split(":")
+        return 2 if env_name.startswith("nusc") else 3
 
     def add_map_element(self, map_elem: MapElement) -> None:
         self.elements[map_elem.elem_type][map_elem.id] = map_elem
+        if map_elem.elem_type == MapElementType.ROAD_LANE:
+            self.lanes = None
+        elif map_elem.elem_type == MapElementType.ROAD:
+            assert isinstance(map_elem, Road)
+            self.roads = None
+            for lane_id in map_elem.lane_ids:
+                self.lane_to_road[lane_id] = map_elem.id
 
     def compute_search_indices(self) -> None:
         # TODO(bivanovic@nvidia.com): merge tree dicts?
@@ -78,6 +100,20 @@ class VectorMap:
             ]
         }
 
+    def configure_search_indices(self) -> None:
+        if self.search_kdtrees is None:
+            return
+        for kdtree in self.search_kdtrees.values():
+            if hasattr(kdtree, "configure_for_vector_map"):
+                kdtree.configure_for_vector_map(self)
+
+    def _lane_kdtree(self) -> LaneCenterKDTree:
+        assert (
+            self.search_kdtrees is not None
+        ), "Search KDTree not found, please rebuild cache."
+        self.configure_search_indices()
+        return self.search_kdtrees[MapElementType.ROAD_LANE]
+
     def iter_elems(self) -> Iterator[MapElement]:
         for elems_dict in self.elements.values():
             for elem in elems_dict.values():
@@ -85,6 +121,18 @@ class VectorMap:
 
     def get_road_lane(self, lane_id: str) -> RoadLane:
         return self.elements[MapElementType.ROAD_LANE][lane_id]
+
+    def get_road(self, road_id: str) -> Road:
+        return self.elements[MapElementType.ROAD][road_id]
+
+    def get_road_area(self, road_area_id: str) -> RoadArea:
+        return self.elements[MapElementType.ROAD_AREA][road_area_id]
+
+    def road_for_lane(self, lane_id: str) -> Optional[Road]:
+        road_id = self.lane_to_road.get(lane_id)
+        if road_id is None:
+            return None
+        return self.get_road(road_id)
 
     def __len__(self) -> int:
         return sum(len(elems_dict) for elems_dict in self.elements.values())
@@ -137,6 +185,24 @@ class VectorMap:
                     hole.xyz,
                     shifted_origin,
                 )
+
+    def _write_roads(self, vectorized_map: map_proto.VectorizedMap) -> None:
+        road: Road
+        for elem_id, road in self.elements[MapElementType.ROAD].items():
+            new_element: map_proto.MapElement = vectorized_map.elements.add()
+            new_element.id = elem_id.encode()
+
+            new_road: map_proto.Road = new_element.road
+            new_road.road_area = road.road_area_id.encode()
+            new_road.lanes.extend(
+                [lane_id.encode() for lane_id in sorted(road.lane_ids)]
+            )
+            new_road.entry_roads.extend(
+                [road_id.encode() for road_id in sorted(road.prev_roads)]
+            )
+            new_road.exit_roads.extend(
+                [road_id.encode() for road_id in sorted(road.next_roads)]
+            )
 
     def _write_ped_crosswalks(
         self, vectorized_map: map_proto.VectorizedMap, shifted_origin: np.ndarray
@@ -193,6 +259,7 @@ class VectorMap:
         # Populating the elements in the vectorized map protobuf.
         self._write_road_lanes(output_map, shifted_origin)
         self._write_road_areas(output_map, shifted_origin)
+        self._write_roads(output_map)
         self._write_ped_crosswalks(output_map, shifted_origin)
         self._write_ped_walkways(output_map, shifted_origin)
 
@@ -202,7 +269,8 @@ class VectorMap:
     def from_proto(cls, vec_map: map_proto.VectorizedMap, **kwargs):
         # Options for which map elements to include.
         incl_road_lanes: bool = kwargs.get("incl_road_lanes", True)
-        incl_road_areas: bool = kwargs.get("incl_road_areas", False)
+        incl_road_areas: bool = kwargs.get("incl_road_areas", True)
+        incl_roads: bool = kwargs.get("incl_roads", True)
         incl_ped_crosswalks: bool = kwargs.get("incl_ped_crosswalks", False)
         incl_ped_walkways: bool = kwargs.get("incl_ped_walkways", False)
 
@@ -300,6 +368,18 @@ class VectorMap:
                 curr_area = RoadArea(elem_id, exterior, interior_holes)
                 map_elem_dict[MapElementType.ROAD_AREA][elem_id] = curr_area
 
+            elif incl_roads and map_elem.HasField("road"):
+                road_obj: map_proto.Road = map_elem.road
+
+                curr_road = Road(
+                    elem_id,
+                    road_area_id=road_obj.road_area.decode(),
+                    lane_ids=set([iden.decode() for iden in road_obj.lanes]),
+                    prev_roads=set([iden.decode() for iden in road_obj.entry_roads]),
+                    next_roads=set([iden.decode() for iden in road_obj.exit_roads]),
+                )
+                map_elem_dict[MapElementType.ROAD][elem_id] = curr_road
+
             elif incl_ped_crosswalks and map_elem.HasField("ped_crosswalk"):
                 ped_crosswalk_obj: map_proto.PedCrosswalk = map_elem.ped_crosswalk
 
@@ -359,37 +439,25 @@ class VectorMap:
         Returns:
             List[RoadLane]: List of possible road lanes that agent could be on
         """
-        assert (
-            self.search_kdtrees is not None
-        ), "Search KDTree not found, please rebuild cache."
-        lane_kdtree: LaneCenterKDTree = self.search_kdtrees[MapElementType.ROAD_LANE]
+        lane_kdtree = self._lane_kdtree()
         return [
             self.lanes[idx]
             for idx in lane_kdtree.current_lane_inds(xyzh, max_dist, max_heading_error)
         ]
 
     def get_closest_lane(self, xyz: np.ndarray) -> RoadLane:
-        assert (
-            self.search_kdtrees is not None
-        ), "Search KDTree not found, please rebuild cache."
-        lane_kdtree: LaneCenterKDTree = self.search_kdtrees[MapElementType.ROAD_LANE]
+        lane_kdtree = self._lane_kdtree()
         return self.lanes[lane_kdtree.closest_polyline_ind(xyz)]
 
     def get_closest_unique_lanes(self, xyz_vec: np.ndarray) -> List[RoadLane]:
-        assert (
-            self.search_kdtrees is not None
-        ), "Search KDTree not found, please rebuild cache."
         assert xyz_vec.ndim == 2  # xyz_vec is assumed to be (*, 3)
-        lane_kdtree: LaneCenterKDTree = self.search_kdtrees[MapElementType.ROAD_LANE]
+        lane_kdtree = self._lane_kdtree()
         closest_inds = lane_kdtree.closest_polyline_ind(xyz_vec)
         unique_inds = np.unique(closest_inds)
         return [self.lanes[ind] for ind in unique_inds]
 
     def get_lanes_within(self, xyz: np.ndarray, dist: float) -> List[RoadLane]:
-        assert (
-            self.search_kdtrees is not None
-        ), "Search KDTree not found, please rebuild cache."
-        lane_kdtree: LaneCenterKDTree = self.search_kdtrees[MapElementType.ROAD_LANE]
+        lane_kdtree = self._lane_kdtree()
         return [
             self.lanes[idx] for idx in lane_kdtree.polyline_inds_in_range(xyz, dist)
         ]

@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from trajdata.maps.map_strtree import MapElementSTRTree
 
 import pickle
+import shutil
 from math import ceil, floor
 from pathlib import Path
 from typing import Any, Dict, Final, List, Optional, Tuple
@@ -791,6 +792,11 @@ class DataFrameCache(SceneCache):
             dill.dump(vector_map.search_rtrees, f)
 
         # Saving the rasterized map data.
+        if raster_map_path.exists():
+            if raster_map_path.is_dir():
+                shutil.rmtree(raster_map_path)
+            else:
+                raster_map_path.unlink()
         zarr.save(raster_map_path, rasterized_map.data)
 
         # Saving the rasterized map metadata.
