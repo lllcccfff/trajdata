@@ -154,9 +154,14 @@ class RoadLane(MapElement):
 
 
 @dataclass
-class RoadArea(MapElement):
+class RoadAreaPart:
     exterior_polygon: Polyline
     interior_holes: List[Polyline] = field(default_factory=lambda: list())
+
+
+@dataclass
+class RoadArea(MapElement):
+    areas: List[RoadAreaPart]
     elem_type: MapElementType = MapElementType.ROAD_AREA
 
 

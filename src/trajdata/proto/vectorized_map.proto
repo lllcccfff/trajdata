@@ -77,7 +77,7 @@ message RoadLane {
   repeated bytes adjacent_lanes_right = 7;
 }
 
-message RoadArea {
+message RoadAreaPart {
   // The polygon defining the outline of general driveable area. This acts as a 
   // catch-all when there's a road segment without lane information.
   // For example, intersections in nuScenes are not "lanes".
@@ -87,9 +87,13 @@ message RoadArea {
   repeated Polyline interior_holes = 2;
 }
 
+message RoadArea {
+  // Polygon components composing one logical driveable area.
+  repeated RoadAreaPart areas = 1;
+}
+
 message Road {
-  // The corresponding RoadArea polygon ID. Road and RoadArea should share
-  // the same ID when the source map provides one polygon per road.
+  // The corresponding logical RoadArea ID.
   bytes road_area = 1;
 
   // IDs for all lanes belonging to this road, including lane connectors.

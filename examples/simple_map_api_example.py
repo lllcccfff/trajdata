@@ -82,8 +82,11 @@ def main():
     end = time.perf_counter()
     print(f"Getting nearest area took {(end-start)*1000:.2f} ms")
 
-    raster_pts = map_utils.transform_points(area.exterior_polygon.xy, raster_from_world)
-    ax.fill(raster_pts[:, 0], raster_pts[:, 1], alpha=1.0, color="C0")
+    for area_part in area.areas:
+        raster_pts = map_utils.transform_points(
+            area_part.exterior_polygon.xy, raster_from_world
+        )
+        ax.fill(raster_pts[:, 0], raster_pts[:, 1], alpha=1.0, color="C0")
 
     print("Getting road areas within 100m...")
     start = time.perf_counter()
@@ -94,10 +97,11 @@ def main():
     print(f"Getting areas within took {(end-start)*1000:.2f} ms")
 
     for area in areas:
-        raster_pts = map_utils.transform_points(
-            area.exterior_polygon.xy, raster_from_world
-        )
-        ax.fill(raster_pts[:, 0], raster_pts[:, 1], alpha=0.2, color="C1")
+        for area_part in area.areas:
+            raster_pts = map_utils.transform_points(
+                area_part.exterior_polygon.xy, raster_from_world
+            )
+            ax.fill(raster_pts[:, 0], raster_pts[:, 1], alpha=0.2, color="C1")
 
     ax.axis("equal")
     ax.grid(None)

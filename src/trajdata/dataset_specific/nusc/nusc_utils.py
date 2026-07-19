@@ -1,4 +1,4 @@
-from typing import Any, Dict, Final, List, Set, Tuple, Union
+from typing import Any, Dict, Final, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -7,8 +7,9 @@ from nuscenes.map_expansion.map_api import NuScenesMap
 from nuscenes.nuscenes import NuScenes
 from pyquaternion import Quaternion
 from scipy.spatial.distance import cdist
-from shapely.geometry import Polygon
+from shapely.geometry import MultiPolygon, Point, Polygon
 from shapely.ops import unary_union
+from shapely.strtree import STRtree
 from tqdm import tqdm
 
 from trajdata.data_structures import Agent, AgentMetadata, AgentType, FixedExtent, Scene
@@ -20,6 +21,7 @@ from trajdata.maps.vec_map_elements import (
     Polyline,
     Road,
     RoadArea,
+    RoadAreaPart,
     RoadLane,
 )
 from trajdata.utils import arr_utils, map_utils
@@ -374,21 +376,32 @@ def extract_area(nusc_map: NuScenesMap, area_record) -> np.ndarray:
     return np.array([(node["x"], node["y"]) for node in polygon_nodes])
 
 
-def _lane_center_midpoint(nusc_map: NuScenesMap, lane_id: str) -> np.ndarray:
-    center = np.asarray(
-        arcline_path_utils.discretize_lane(
-            nusc_map.arcline_path_3.get(lane_id, []), 1.0
-        )
-    )
-    return center[len(center) // 2]
-
-
 def _assign_lanes_to_roads(nusc_map: NuScenesMap, lane_ids: Set[str]) -> Dict[str, str]:
+    road_block_ids = [road_record["token"] for road_record in nusc_map.road_block]
+    road_block_polygons = [
+        nusc_map.extract_polygon(road_record["polygon_token"])
+        for road_record in nusc_map.road_block
+    ]
+    road_block_tree = STRtree(road_block_polygons)
+
     lane_to_road = {}
     for lane_id in lane_ids:
-        mid = _lane_center_midpoint(nusc_map, lane_id)
-        road_id = nusc_map.record_on_point(float(mid[0]), float(mid[1]), "road_block")
-        if road_id != "":
+        lane_record = nusc_map.get("lane", lane_id)
+        centerline = extract_lane_center(nusc_map, lane_record)
+        road_block_counts: Dict[str, int] = {}
+        for center_point in centerline:
+            point = Point(float(center_point[0]), float(center_point[1]))
+            for road_block_idx in sorted(road_block_tree.query(point)):
+                if point.within(road_block_polygons[road_block_idx]):
+                    road_id = road_block_ids[road_block_idx]
+                    road_block_counts[road_id] = road_block_counts.get(road_id, 0) + 1
+                    break
+
+        if not road_block_counts:
+            continue
+
+        road_id, count = max(road_block_counts.items(), key=lambda item: item[1])
+        if count / len(centerline) >= 0.4:
             lane_to_road[lane_id] = road_id
     return lane_to_road
 
@@ -397,26 +410,42 @@ def _connector_road_id(prev_road_id: str, next_road_id: str) -> str:
     return f"lane_connector:{prev_road_id}:{next_road_id}"
 
 
+def _boundary_connector_road_id(lane_id: str) -> str:
+    return f"lane_connector:boundary:{lane_id}"
+
+
 def _assign_lane_connectors_to_connector_roads(
     vector_map: VectorMap,
     lane_connector_ids: Set[str],
     lane_to_road: Dict[str, str],
-) -> Tuple[Dict[str, str], Dict[str, Tuple[str, str]]]:
+) -> Tuple[Dict[str, str], Dict[str, Tuple[Optional[str], Optional[str]]]]:
     connector_lane_to_road: Dict[str, str] = {}
-    connector_road_pairs: Dict[str, Tuple[str, str]] = {}
+    connector_road_pairs: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
     for lane_id in lane_connector_ids:
         lane = vector_map.get_road_lane(lane_id)
-        prev_road_ids = {lane_to_road[prev_lane_id] for prev_lane_id in lane.prev_lanes}
-        next_road_ids = {lane_to_road[next_lane_id] for next_lane_id in lane.next_lanes}
-        if len(prev_road_ids) != 1 or len(next_road_ids) != 1:
+        prev_road_ids = {
+            lane_to_road[prev_lane_id]
+            for prev_lane_id in lane.prev_lanes
+            if prev_lane_id in lane_to_road
+        }
+        next_road_ids = {
+            lane_to_road[next_lane_id]
+            for next_lane_id in lane.next_lanes
+            if next_lane_id in lane_to_road
+        }
+        if len(prev_road_ids) > 1 or len(next_road_ids) > 1:
             raise RuntimeError(
-                f"NuScenes lane connector {lane_id} must map to one previous road "
-                f"and one next road, got {prev_road_ids} -> {next_road_ids}."
+                f"NuScenes lane connector {lane_id} must map to at most one previous "
+                f"road and one next road, got {prev_road_ids} -> {next_road_ids}."
             )
 
-        prev_road_id = next(iter(prev_road_ids))
-        next_road_id = next(iter(next_road_ids))
-        connector_road_id = _connector_road_id(prev_road_id, next_road_id)
+        prev_road_id = next(iter(prev_road_ids), None)
+        next_road_id = next(iter(next_road_ids), None)
+        connector_road_id = (
+            _connector_road_id(prev_road_id, next_road_id)
+            if prev_road_id is not None and next_road_id is not None
+            else _boundary_connector_road_id(lane_id)
+        )
         connector_lane_to_road[lane_id] = connector_road_id
         connector_road_pairs[connector_road_id] = (prev_road_id, next_road_id)
 
@@ -495,19 +524,33 @@ def _road_lane_area_polygon(lane: RoadLane) -> Polygon:
     return lane_area
 
 
-def _polygon_to_road_area(road_area_id: str, polygon: Polygon) -> RoadArea:
-    exterior = np.asarray(polygon.exterior.coords[:-1], dtype=float)
-    if exterior.shape[0] < 3:
-        raise RuntimeError(f"Road area {road_area_id} has fewer than three points.")
+def _polygon_to_road_area(
+    road_id: str, geometry: Union[Polygon, MultiPolygon]
+) -> RoadArea:
+    if isinstance(geometry, Polygon):
+        polygons = [geometry]
+    elif isinstance(geometry, MultiPolygon):
+        polygons = sorted(geometry.geoms, key=lambda polygon: polygon.wkb)
+    else:
+        raise TypeError(
+            f"Road {road_id} has unsupported geometry {geometry.geom_type}."
+        )
 
-    road_area = RoadArea(id=road_area_id, exterior_polygon=Polyline(exterior))
-    for interior in polygon.interiors:
-        hole = np.asarray(interior.coords[:-1], dtype=float)
-        if hole.shape[0] < 3:
-            raise RuntimeError(f"Road area {road_area_id} has an invalid hole.")
-        road_area.interior_holes.append(Polyline(hole))
+    areas: List[RoadAreaPart] = list()
+    for polygon in polygons:
+        exterior = np.asarray(polygon.exterior.coords[:-1], dtype=float)
+        if exterior.shape[0] < 3:
+            raise RuntimeError(f"Road area {road_id} has fewer than three points.")
 
-    return road_area
+        area = RoadAreaPart(exterior_polygon=Polyline(exterior))
+        for interior in polygon.interiors:
+            hole = np.asarray(interior.coords[:-1], dtype=float)
+            if hole.shape[0] < 3:
+                raise RuntimeError(f"Road area {road_id} has an invalid hole.")
+            area.interior_holes.append(Polyline(hole))
+        areas.append(area)
+
+    return RoadArea(id=road_id, areas=areas)
 
 
 def _add_connector_road_area(
@@ -519,14 +562,9 @@ def _add_connector_road_area(
     connector_area = unary_union(
         [
             _road_lane_area_polygon(vector_map.get_road_lane(lane_id))
-            for lane_id in lane_ids
+            for lane_id in sorted(lane_ids)
         ]
     )
-    if not isinstance(connector_area, Polygon):
-        raise RuntimeError(
-            f"Connector road {connector_road_id} did not form a single polygon."
-        )
-
     vector_map.add_map_element(
         _polygon_to_road_area(connector_road_id, connector_area)
     )
@@ -547,16 +585,19 @@ def add_nusc_road_topology(
         for lane_record in nusc_map.lane_connector
         if lane_record["token"] in lane_ids
     }
-    road_ids = {road_record["token"] for road_record in nusc_map.road_block}
-
     lane_to_road = _assign_lanes_to_roads(nusc_map, lane_layer_ids)
+    discarded_lane_ids = lane_layer_ids.difference(lane_to_road)
+    for lane_id in discarded_lane_ids:
+        del vector_map.elements[MapElementType.ROAD_LANE][lane_id]
+    lane_ids.difference_update(discarded_lane_ids)
+
     connector_lane_to_road, connector_road_pairs = (
         _assign_lane_connectors_to_connector_roads(
             vector_map, lane_connector_layer_ids, lane_to_road
         )
     )
     lane_to_road.update(connector_lane_to_road)
-    road_ids.update(connector_road_pairs)
+    road_ids = set(lane_to_road.values())
     missing_lane_ids = lane_ids.difference(lane_to_road)
     if missing_lane_ids:
         raise RuntimeError(
@@ -578,26 +619,25 @@ def add_nusc_road_topology(
     vector_map.lane_to_road.clear()
     vector_map.roads = None
 
-    for road_record in nusc_map.road_block:
-        road_id = road_record["token"]
-        _add_nusc_road_area(vector_map, nusc_map, road_record)
-        vector_map.add_map_element(
-            Road(
-                id=road_id,
-                road_area_id=road_id,
-                lane_ids=road_to_lanes.get(road_id, set()),
-                next_roads=road_successors[road_id],
+    road_records = {
+        road_record["token"]: road_record for road_record in nusc_map.road_block
+    }
+    connector_road_ids = set(connector_road_pairs)
+    for road_id in sorted(road_ids):
+        if road_id in road_records:
+            _add_nusc_road_area(vector_map, nusc_map, road_records[road_id])
+        elif road_id in connector_road_ids:
+            _add_connector_road_area(vector_map, road_id, road_to_lanes[road_id])
+        else:
+            raise RuntimeError(
+                f"NuScenes road {road_id} has no road block or lane connector."
             )
-        )
 
-    for road_id, (prev_road_id, next_road_id) in connector_road_pairs.items():
-        _add_connector_road_area(vector_map, road_id, road_to_lanes[road_id])
         vector_map.add_map_element(
             Road(
                 id=road_id,
                 road_area_id=road_id,
                 lane_ids=road_to_lanes[road_id],
-                prev_roads={prev_road_id},
                 next_roads=road_successors[road_id],
             )
         )
@@ -647,11 +687,11 @@ def _add_nusc_road_area(
         return
 
     polygon_pts = extract_area(nusc_map, road_record)
-    road_area = RoadArea(id=road_id, exterior_polygon=Polyline(polygon_pts))
+    road_area_part = RoadAreaPart(exterior_polygon=Polyline(polygon_pts))
     for hole in road_record["holes"]:
         hole_pts = extract_area(nusc_map, hole)
-        road_area.interior_holes.append(Polyline(hole_pts))
-    vector_map.add_map_element(road_area)
+        road_area_part.interior_holes.append(Polyline(hole_pts))
+    vector_map.add_map_element(RoadArea(id=road_id, areas=[road_area_part]))
 
 
 def populate_vector_map(vector_map: VectorMap, nusc_map: NuScenesMap) -> None:
@@ -672,7 +712,6 @@ def populate_vector_map(vector_map: VectorMap, nusc_map: NuScenesMap) -> None:
         + len(nusc_map.lane_connector)
         + len(nusc_map.road_block)
         + len(nusc_map.road_segment)
-        + len(nusc_map.drivable_area)
         + len(nusc_map.ped_crossing)
         + len(nusc_map.walkway),
         desc=f"Getting {nusc_map.map_name} Elements",
@@ -729,34 +768,6 @@ def populate_vector_map(vector_map: VectorMap, nusc_map: NuScenesMap) -> None:
             overall_pbar.update()
             continue
         overall_pbar.update()
-
-    for drivable_area in nusc_map.drivable_area:
-        for polygon_token in drivable_area["polygon_tokens"]:
-            if (
-                polygon_token is None
-                and str(None) in vector_map.elements[MapElementType.ROAD_AREA]
-            ):
-                # See below, but essentially nuScenes has two None polygon_tokens
-                # back-to-back, so we don't need the second one.
-                continue
-
-            polygon_record = nusc_map.get("polygon", polygon_token)
-            polygon_pts = extract_area(nusc_map, polygon_record)
-
-            # NOTE: nuScenes has some polygon_tokens that are None, although that
-            # doesn't stop the above get(...) function call so it's fine,
-            # just have to be mindful of this when creating the id.
-            new_road_area = RoadArea(
-                id=str(polygon_token), exterior_polygon=Polyline(polygon_pts)
-            )
-
-            for hole in polygon_record["holes"]:
-                polygon_pts = extract_area(nusc_map, hole)
-                new_road_area.interior_holes.append(Polyline(polygon_pts))
-
-            # Adding the element to the map.
-            vector_map.add_map_element(new_road_area)
-            overall_pbar.update()
 
     for ped_area_record in nusc_map.ped_crossing:
         polygon_pts = extract_area(nusc_map, ped_area_record)

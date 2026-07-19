@@ -23,7 +23,13 @@ from av2.map.map_api import ArgoverseStaticMap
 
 from trajdata.data_structures.agent import AgentMetadata, AgentType, FixedExtent
 from trajdata.maps.vec_map import VectorMap
-from trajdata.maps.vec_map_elements import PedCrosswalk, Polyline, RoadArea, RoadLane
+from trajdata.maps.vec_map_elements import (
+    PedCrosswalk,
+    Polyline,
+    RoadArea,
+    RoadAreaPart,
+    RoadLane,
+)
 
 AV2_SPLITS = ("train", "val", "test")
 DELIM = "_"
@@ -182,7 +188,7 @@ def av2_map_to_vector_map(map_id: str, av2_map: ArgoverseStaticMap) -> VectorMap
         vector_map.add_map_element(
             RoadArea(
                 id=_road_area_id(drivavble_area.id),
-                exterior_polygon=Polyline(drivavble_area.xyz),
+                areas=[RoadAreaPart(exterior_polygon=Polyline(drivavble_area.xyz))],
             )
         )
 

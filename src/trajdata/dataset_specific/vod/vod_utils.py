@@ -17,6 +17,7 @@ from trajdata.maps.vec_map_elements import (
     PedWalkway,
     Polyline,
     RoadArea,
+    RoadAreaPart,
     RoadLane,
 )
 from trajdata.utils import arr_utils, map_utils
@@ -475,16 +476,16 @@ def populate_vector_map(vector_map: VectorMap, vod_map: VODMap) -> None:
             # NOTE: VoD has some polygon_tokens that are None, although that
             # doesn't stop the above get(...) function call so it's fine,
             # just have to be mindful of this when creating the id.
-            new_road_area = RoadArea(
-                id=str(polygon_token), exterior_polygon=Polyline(polygon_pts)
-            )
+            road_area_part = RoadAreaPart(exterior_polygon=Polyline(polygon_pts))
 
             for hole in polygon_record["holes"]:
                 polygon_pts = extract_area(vod_map, hole)
-                new_road_area.interior_holes.append(Polyline(polygon_pts))
+                road_area_part.interior_holes.append(Polyline(polygon_pts))
 
             # Adding the element to the map.
-            vector_map.add_map_element(new_road_area)
+            vector_map.add_map_element(
+                RoadArea(id=str(polygon_token), areas=[road_area_part])
+            )
             overall_pbar.update()
 
     for ped_area_record in vod_map.ped_crossing:

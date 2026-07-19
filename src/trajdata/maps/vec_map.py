@@ -39,6 +39,7 @@ from trajdata.maps.vec_map_elements import (
     Polyline,
     Road,
     RoadArea,
+    RoadAreaPart,
     RoadLane,
 )
 from trajdata.utils import map_utils, raster_utils
@@ -171,20 +172,23 @@ class VectorMap:
             new_element.id = elem_id.encode()
 
             new_area: map_proto.RoadArea = new_element.road_area
-            map_utils.populate_polygon(
-                new_area.exterior_polygon,
-                road_area.exterior_polygon.xyz,
-                shifted_origin,
-            )
-
-            hole: Polyline
-            for hole in road_area.interior_holes:
-                new_hole: map_proto.Polyline = new_area.interior_holes.add()
+            road_area_part: RoadAreaPart
+            for road_area_part in road_area.areas:
+                # 新建 protobuf 子区域，并把已有子区域的边界坐标平移到局部原点后写入。
+                new_part: map_proto.RoadAreaPart = new_area.areas.add()
                 map_utils.populate_polygon(
-                    new_hole,
-                    hole.xyz,
+                    new_part.exterior_polygon,
+                    road_area_part.exterior_polygon.xyz,
                     shifted_origin,
                 )
+                hole: Polyline
+                for hole in road_area_part.interior_holes:
+                    new_hole: map_proto.Polyline = new_part.interior_holes.add()
+                    map_utils.populate_polygon(
+                        new_hole,
+                        hole.xyz,
+                        shifted_origin,
+                    )
 
     def _write_roads(self, vectorized_map: map_proto.VectorizedMap) -> None:
         road: Road
@@ -347,25 +351,29 @@ class VectorMap:
 
             elif incl_road_areas and map_elem.HasField("road_area"):
                 road_area_obj: map_proto.RoadArea = map_elem.road_area
-
-                exterior: Polyline = Polyline(
-                    map_utils.proto_to_np(
-                        road_area_obj.exterior_polygon, incl_heading=False
-                    )
-                    + shifted_origin[:3]
-                )
-
-                interior_holes: List[Polyline] = list()
-                interior_hole: map_proto.Polyline
-                for interior_hole in road_area_obj.interior_holes:
-                    interior_holes.append(
-                        Polyline(
-                            map_utils.proto_to_np(interior_hole, incl_heading=False)
-                            + shifted_origin[:3]
+                areas: List[RoadAreaPart] = list()
+                road_area_part: map_proto.RoadAreaPart
+                for road_area_part in road_area_obj.areas:
+                    exterior = Polyline(
+                        map_utils.proto_to_np(
+                            road_area_part.exterior_polygon, incl_heading=False
                         )
+                        + shifted_origin[:3]
                     )
+                    interior_holes: List[Polyline] = list()
+                    interior_hole: map_proto.Polyline
+                    for interior_hole in road_area_part.interior_holes:
+                        interior_holes.append(
+                            Polyline(
+                                map_utils.proto_to_np(
+                                    interior_hole, incl_heading=False
+                                )
+                                + shifted_origin[:3]
+                            )
+                        )
+                    areas.append(RoadAreaPart(exterior, interior_holes))
 
-                curr_area = RoadArea(elem_id, exterior, interior_holes)
+                curr_area = RoadArea(elem_id, areas)
                 map_elem_dict[MapElementType.ROAD_AREA][elem_id] = curr_area
 
             elif incl_roads and map_elem.HasField("road"):

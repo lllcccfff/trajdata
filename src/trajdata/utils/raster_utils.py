@@ -224,18 +224,21 @@ def rasterize_map(
 
         elif map_elem.elem_type == MapElementType.ROAD_AREA:
             # Drawing general road areas.
-            rasterize_world_polygon(
-                map_elem.exterior_polygon.xy,
-                lane_area_img,
-                raster_from_world,
-                color=(255, 0, 0),
-            )
-
-            for interior_hole in map_elem.interior_holes:
-                # Removing holes.
+            for road_area_part in map_elem.areas:
                 rasterize_world_polygon(
-                    interior_hole.xy, lane_area_img, raster_from_world, color=(0, 0, 0)
+                    road_area_part.exterior_polygon.xy,
+                    lane_area_img,
+                    raster_from_world,
+                    color=(255, 0, 0),
                 )
+                for interior_hole in road_area_part.interior_holes:
+                    # Removing holes.
+                    rasterize_world_polygon(
+                        interior_hole.xy,
+                        lane_area_img,
+                        raster_from_world,
+                        color=(0, 0, 0),
+                    )
 
         elif map_elem.elem_type in {
             MapElementType.PED_CROSSWALK,

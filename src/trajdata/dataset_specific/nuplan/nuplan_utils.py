@@ -20,6 +20,7 @@ from trajdata.maps.vec_map_elements import (
     PedWalkway,
     Polyline,
     RoadArea,
+    RoadAreaPart,
     RoadLane,
 )
 from trajdata.utils import map_utils
@@ -341,12 +342,12 @@ def populate_vector_map(
     for fid, polygon_info in nuplan_map._vector_map["drivable_area"].iterrows():
         polygon_pts = extract_area(nuplan_map, polygon_info)
 
-        new_road_area = RoadArea(id=fid, exterior_polygon=Polyline(polygon_pts))
+        road_area_part = RoadAreaPart(exterior_polygon=Polyline(polygon_pts))
         for hole in polygon_info["geometry"].interiors:
             hole_pts = extract_area(nuplan_map, hole)
-            new_road_area.interior_holes.append(Polyline(hole_pts))
+            road_area_part.interior_holes.append(Polyline(hole_pts))
 
-        vector_map.add_map_element(new_road_area)
+        vector_map.add_map_element(RoadArea(id=fid, areas=[road_area_part]))
         overall_pbar.update()
 
     for fid, ped_area_record in nuplan_map._vector_map["crosswalks"].iterrows():

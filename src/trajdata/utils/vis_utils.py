@@ -7,7 +7,7 @@ import pandas as pd
 import seaborn as sns
 from bokeh.models import ColumnDataSource, GlyphRenderer
 from bokeh.plotting import figure
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, MultiPolygon, Polygon
 
 from trajdata.data_structures.agent import AgentType
 from trajdata.data_structures.batch import AgentBatch
@@ -389,9 +389,14 @@ def convert_to_gpd(vec_map: VectorMap) -> gpd.GeoDataFrame:
             geo_data["geometry"].append(Polygon(shell=elem.polygon.xyz))
         elif isinstance(elem, RoadArea):
             geo_data["geometry"].append(
-                Polygon(
-                    shell=elem.exterior_polygon.xyz,
-                    holes=[hole.xyz for hole in elem.interior_holes],
+                MultiPolygon(
+                    [
+                        Polygon(
+                            shell=area.exterior_polygon.xyz,
+                            holes=[hole.xyz for hole in area.interior_holes],
+                        )
+                        for area in elem.areas
+                    ]
                 )
             )
 
@@ -456,16 +461,29 @@ def get_map_cds(
                 road_lane_data["xs"].append(transformed_xy[..., 0])
                 road_lane_data["ys"].append(transformed_xy[..., 1])
         elif row["type"] == MapElementType.ROAD_AREA:
-            xy = np.stack(row["geometry"].exterior.xy, axis=1)
-            holes_xy: List[np.ndarray] = [
-                np.stack(interior.xy, axis=1) for interior in row["geometry"].interiors
-            ]
-
             road_area_data["xs"].append(
-                [[xy[..., 0]] + [hole[..., 0] for hole in holes_xy]]
+                [
+                    [
+                        np.stack(polygon.exterior.xy, axis=1)[..., 0]
+                    ]
+                    + [
+                        np.stack(interior.xy, axis=1)[..., 0]
+                        for interior in polygon.interiors
+                    ]
+                    for polygon in row["geometry"].geoms
+                ]
             )
             road_area_data["ys"].append(
-                [[xy[..., 1]] + [hole[..., 1] for hole in holes_xy]]
+                [
+                    [
+                        np.stack(polygon.exterior.xy, axis=1)[..., 1]
+                    ]
+                    + [
+                        np.stack(interior.xy, axis=1)[..., 1]
+                        for interior in polygon.interiors
+                    ]
+                    for polygon in row["geometry"].geoms
+                ]
             )
     return (
         ColumnDataSource(data=lane_center_data),

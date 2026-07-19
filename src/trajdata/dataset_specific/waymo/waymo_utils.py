@@ -18,6 +18,7 @@ from trajdata.maps.vec_map_elements import (
     Polyline,
     Road,
     RoadArea,
+    RoadAreaPart,
     RoadLane,
 )
 
@@ -214,8 +215,9 @@ def extract_vectorized(
 
     add_waymo_road_topology(vec_map)
     for road_area in vec_map.elements[MapElementType.ROAD_AREA].values():
-        max_pt = np.fmax(max_pt, road_area.exterior_polygon.xyz.max(axis=0))
-        min_pt = np.fmin(min_pt, road_area.exterior_polygon.xyz.min(axis=0))
+        for road_area_part in road_area.areas:
+            max_pt = np.fmax(max_pt, road_area_part.exterior_polygon.xyz.max(axis=0))
+            min_pt = np.fmin(min_pt, road_area_part.exterior_polygon.xyz.min(axis=0))
 
     # Setting the map bounds.
     # vec_map.extent is [min_x, min_y, min_z, max_x, max_y, max_z]
@@ -410,7 +412,7 @@ def add_waymo_road_topology(vec_map: VectorMap) -> None:
         vec_map.add_map_element(
             RoadArea(
                 id=road_id,
-                exterior_polygon=_closed_road_polygon(lanes, lane_ids),
+                areas=[RoadAreaPart(exterior_polygon=_closed_road_polygon(lanes, lane_ids))],
             )
         )
         vec_map.add_map_element(

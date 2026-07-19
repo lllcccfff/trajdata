@@ -7,6 +7,7 @@ if TYPE_CHECKING:
 
 import numpy as np
 from shapely import LinearRing, Polygon, STRtree, linearrings, points, polygons
+from shapely.geometry import MultiPolygon
 from tqdm import tqdm
 
 from trajdata.maps.vec_map_elements import (
@@ -20,12 +21,14 @@ from trajdata.maps.vec_map_elements import (
 
 def polygon_with_holes_geometry(map_element: MapElement) -> Polygon:
     assert isinstance(map_element, RoadArea)
-    points = linearrings(map_element.exterior_polygon.xy)
-    holes: Optional[List[LinearRing]] = None
-    if len(map_element.interior_holes) > 0:
-        holes = [linearrings(hole.xy) for hole in map_element.interior_holes]
-
-    return polygons(points, holes=holes)
+    polygons_list: List[Polygon] = list()
+    for area in map_element.areas:
+        points = linearrings(area.exterior_polygon.xy)
+        holes: Optional[List[LinearRing]] = None
+        if len(area.interior_holes) > 0:
+            holes = [linearrings(hole.xy) for hole in area.interior_holes]
+        polygons_list.append(polygons(points, holes=holes))
+    return MultiPolygon(polygons_list)
 
 
 def polygon_geometry(map_element: MapElement) -> Polygon:
