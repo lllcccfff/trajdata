@@ -34,9 +34,20 @@ def sample_centerline(
 
         All arrays have the same length and empty arrays if no geometry is found.
     """
+    _, center_x, center_y, center_z, headings = sample_centerline_with_s(
+        road, resolution
+    )
+    return center_x, center_y, center_z, headings
+
+
+def sample_centerline_with_s(
+    road: ET.Element, resolution: float
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Sample the road reference line and retain each point's s-coordinate."""
     plan_view = road.find("planView")
     if plan_view is None:
-        return np.zeros(0), np.zeros(0), np.zeros(0), np.zeros(0)
+        empty = np.zeros(0)
+        return empty, empty, empty, empty, empty
 
     # Parse elevation profile
     elevation_profile = road.find("elevationProfile")
@@ -57,6 +68,7 @@ def sample_centerline(
     center_xs: List[float] = []
     center_ys: List[float] = []
     center_zs: List[float] = []
+    center_ss: List[float] = []
     headings: List[float] = []
     cumulative_s = 0.0
 
@@ -114,11 +126,13 @@ def sample_centerline(
         center_xs.extend(xs.tolist())
         center_ys.extend(ys.tolist())
         center_zs.extend(zs.tolist())
+        center_ss.extend((cumulative_s + s_values).tolist())
         headings.extend(hdgs.tolist())
 
         cumulative_s += geom_len
 
     return (
+        np.asarray(center_ss),
         np.asarray(center_xs),
         np.asarray(center_ys),
         np.asarray(center_zs),

@@ -34,7 +34,9 @@ class LaneGeom:
     left_edge: Optional[np.ndarray]  # (N, 3) xyz when present
     right_edge: Optional[np.ndarray]  # (N, 3) xyz when present
     headings: np.ndarray  # (N,) radians
-    road_id: str
+    road_id: str  # lane-section ID
+    xodr_road_id: str
+    lane_section_index: int
     lane_type: str  # Original lane type from XODR (driving, parking, sidewalk, etc.)
     is_driving: bool
     is_left: bool  # True if lane_id > 0 per OpenDRIVE convention
@@ -80,3 +82,11 @@ class ParsedXodr:
     ]  # Values: ((N, 3) xyz polylines, wait_line_type)
     sidewalks: Dict[str, np.ndarray]  # Values: (N, 3) xyz polylines
     crosswalks: Dict[str, np.ndarray]  # Values: (N, 3) xyz polylines
+
+
+def lane_section_id(xodr_road_id: str, section_index: int) -> str:
+    return f"{xodr_road_id}:{section_index}"
+
+
+def lane_unique_id(xodr_road_id: str, section_index: int, lane_id: int) -> str:
+    return f"{lane_section_id(xodr_road_id, section_index)}:{lane_id}"

@@ -21,8 +21,7 @@ from .connectivity import (
     parse_lane_successors_predecessors,
     process_junction_connections,
 )
-from .datatypes import LaneGeom, ParsedXodr
-from .filtering import filter_road_edges, get_junction_road_ids
+from .datatypes import LaneGeom, ParsedXodr, lane_unique_id
 from .geometry import sample_centerline
 from .lane_processing import process_road
 from .traffic_elements import (
@@ -58,8 +57,6 @@ def parse_xodr(xodr_str: str, resolution: float = 0.5) -> ParsedXodr:
     max_xyz = np.full((3,), -np.inf)
 
     # First pass: Process roads to create lanes and edges
-    junction_road_ids = get_junction_road_ids(root)
-
     for road in root.findall("road"):
         min_xyz, max_xyz = process_road(
             road, resolution, lane_geoms, road_edges, min_xyz, max_xyz, sidewalks
@@ -98,9 +95,6 @@ def parse_xodr(xodr_str: str, resolution: float = 0.5) -> ParsedXodr:
 
     # Associate infrastructure with lanes
     associate_infrastructure_with_lanes(lane_geoms, traffic_signs, wait_lines)
-
-    # Fourth pass: Filter road edges
-    road_edges = filter_road_edges(road_edges, lane_geoms, junction_road_ids)
 
     # Create final result
     extent = np.concatenate([min_xyz, max_xyz])
@@ -251,7 +245,7 @@ def _parse_neighbor_lanes(root: ET.Element, lane_geoms: Dict[str, LaneGeom]) -> 
 
                 for lane in side_elem.findall("lane"):
                     lane_id = int(lane.attrib["id"])
-                    unique_id = f"{road_id}_{lane_id}"
+                    unique_id = lane_unique_id(road_id, section_idx, lane_id)
 
                     if unique_id not in lane_geoms:
                         continue
@@ -270,9 +264,13 @@ def _parse_neighbor_lanes(root: ET.Element, lane_geoms: Dict[str, LaneGeom]) -> 
                         if neighbor_id:
                             direction = left_elem.attrib.get("direction", "forward")
                             if direction == "forward":
-                                lg.left_neighbor_forward.add(f"{road_id}_{neighbor_id}")
+                                lg.left_neighbor_forward.add(
+                                    lane_unique_id(road_id, section_idx, int(neighbor_id))
+                                )
                             elif direction == "backward":
-                                lg.left_neighbor_backward.add(f"{road_id}_{neighbor_id}")
+                                lg.left_neighbor_backward.add(
+                                    lane_unique_id(road_id, section_idx, int(neighbor_id))
+                                )
 
                     # Right neighbor
                     right_elem = link_elem.find("right")
@@ -281,6 +279,10 @@ def _parse_neighbor_lanes(root: ET.Element, lane_geoms: Dict[str, LaneGeom]) -> 
                         if neighbor_id:
                             direction = right_elem.attrib.get("direction", "forward")
                             if direction == "forward":
-                                lg.right_neighbor_forward.add(f"{road_id}_{neighbor_id}")
+                                lg.right_neighbor_forward.add(
+                                    lane_unique_id(road_id, section_idx, int(neighbor_id))
+                                )
                             elif direction == "backward":
-                                lg.right_neighbor_backward.add(f"{road_id}_{neighbor_id}")
+                                lg.right_neighbor_backward.add(
+                                    lane_unique_id(road_id, section_idx, int(neighbor_id))
+                                )

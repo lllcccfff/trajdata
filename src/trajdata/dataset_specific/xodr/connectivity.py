@@ -7,9 +7,9 @@ and junction connections.
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-from typing import Dict, List
+from typing import Dict, List, Optional
 
-from .datatypes import LaneGeom
+from .datatypes import LaneGeom, lane_section_id, lane_unique_id
 
 
 def build_lane_adjacency(road_to_lanes: Dict[str, List[LaneGeom]]) -> None:
@@ -118,7 +118,7 @@ def extract_road_connections(root: ET.Element) -> Dict[str, Dict]:
 def _add_lane_link_connection(
     link_elem: ET.Element,
     link_type: str,
-    connected_road_id: str,
+    connected_section_id: Optional[str],
     current_lane_id: str,
     current_lane_geom: LaneGeom,
     lane_geoms: Dict[str, LaneGeom],
@@ -143,8 +143,8 @@ def _add_lane_link_connection(
     elem = link_elem.find(link_type)
     if elem is not None:
         connected_lane_id = elem.attrib.get("id")
-        if connected_lane_id and connected_road_id is not None:
-            connected_unique_id = f"{connected_road_id}_{connected_lane_id}"
+        if connected_lane_id and connected_section_id is not None:
+            connected_unique_id = f"{connected_section_id}:{connected_lane_id}"
             if connected_unique_id in lane_geoms:
                 if to_next:
                     current_lane_geom.next_lanes.add(connected_unique_id)
@@ -173,17 +173,25 @@ def parse_lane_successors_predecessors(
         if lanes_elem is None:
             continue
 
-        # Get the successor/predecessor road IDs for this road
-        successor_road_id = None
-        predecessor_road_id = None
+        successor = None
+        predecessor = None
 
         if road_id in road_connections:
-            if "successor" in road_connections[road_id]:
-                successor_road_id = road_connections[road_id]["successor"]["road_id"]
-            if "predecessor" in road_connections[road_id]:
-                predecessor_road_id = road_connections[road_id]["predecessor"]["road_id"]
+            successor = road_connections[road_id].get("successor")
+            predecessor = road_connections[road_id].get("predecessor")
 
-        for lane_section in lanes_elem.findall("laneSection"):
+        lane_sections = lanes_elem.findall("laneSection")
+        for section_index, lane_section in enumerate(lane_sections):
+            successor_section_id = (
+                lane_section_id(road_id, section_index + 1)
+                if section_index + 1 < len(lane_sections)
+                else _connected_section_id(root, successor)
+            )
+            predecessor_section_id = (
+                lane_section_id(road_id, section_index - 1)
+                if section_index > 0
+                else _connected_section_id(root, predecessor)
+            )
             for side in ["left", "right"]:
                 side_elem = lane_section.find(side)
                 if side_elem is None:
@@ -191,7 +199,7 @@ def parse_lane_successors_predecessors(
 
                 for lane in side_elem.findall("lane"):
                     lane_id = int(lane.attrib["id"])
-                    unique_id = f"{road_id}_{lane_id}"
+                    unique_id = lane_unique_id(road_id, section_index, lane_id)
 
                     if unique_id not in lane_geoms:
                         continue
@@ -215,7 +223,7 @@ def parse_lane_successors_predecessors(
                     _add_lane_link_connection(
                         link_elem,
                         "successor",
-                        successor_road_id,
+                        successor_section_id,
                         unique_id,
                         lg,
                         lane_geoms,
@@ -228,12 +236,48 @@ def parse_lane_successors_predecessors(
                     _add_lane_link_connection(
                         link_elem,
                         "predecessor",
-                        predecessor_road_id,
+                        predecessor_section_id,
                         unique_id,
                         lg,
                         lane_geoms,
                         to_next=should_invert,
                     )
+
+
+def _connected_section_id(root: ET.Element, connection: Optional[Dict]) -> Optional[str]:
+    if connection is None:
+        return None
+    connected_road_id = connection["road_id"]
+    connected_road = next(
+        (road for road in root.findall("road") if road.attrib["id"] == connected_road_id),
+        None,
+    )
+    if connected_road is None:
+        raise KeyError(f"XODR references missing road {connected_road_id}")
+    lane_sections = connected_road.findall("lanes/laneSection")
+    if not lane_sections:
+        raise ValueError(f"XODR road {connected_road_id} has no laneSection")
+    contact_point = connection["contactPoint"]
+    section_index = 0 if contact_point == "start" else len(lane_sections) - 1
+    return lane_section_id(connected_road_id, section_index)
+
+
+def _junction_endpoint_section_index(road: ET.Element, junction_id: str) -> int:
+    lane_sections = road.findall("lanes/laneSection")
+    if not lane_sections:
+        raise ValueError(f"XODR road {road.attrib['id']} has no laneSection")
+    for tag, section_index in (("predecessor", 0), ("successor", len(lane_sections) - 1)):
+        link = road.find(f"link/{tag}")
+        if (
+            link is not None
+            and link.attrib.get("elementType") == "junction"
+            and link.attrib.get("elementId") == junction_id
+        ):
+            return section_index
+    raise ValueError(
+        f"XODR junction {junction_id} names incoming road {road.attrib['id']}, "
+        "but that road does not link to the junction."
+    )
 
 
 def process_junction_connections(
@@ -250,6 +294,7 @@ def process_junction_connections(
         lane_geoms: Dictionary of lane geometries to update
     """
     for junction in root.findall("junction"):
+        junction_id = junction.attrib["id"]
         for connection in junction.findall("connection"):
             incoming_road = connection.attrib.get("incomingRoad")
             connecting_road = connection.attrib.get("connectingRoad")
@@ -257,6 +302,29 @@ def process_junction_connections(
 
             if not incoming_road or not connecting_road:
                 continue
+
+            incoming_road_elem = next(
+                (road for road in root.findall("road") if road.attrib["id"] == incoming_road),
+                None,
+            )
+            connecting_road_elem = next(
+                (road for road in root.findall("road") if road.attrib["id"] == connecting_road),
+                None,
+            )
+            if incoming_road_elem is None or connecting_road_elem is None:
+                raise KeyError(
+                    f"XODR junction {junction_id} references missing road in "
+                    f"{incoming_road} -> {connecting_road}"
+                )
+            incoming_section_index = _junction_endpoint_section_index(
+                incoming_road_elem, junction_id
+            )
+            connecting_sections = connecting_road_elem.findall("lanes/laneSection")
+            if not connecting_sections:
+                raise ValueError(f"XODR road {connecting_road} has no laneSection")
+            connecting_section_index = (
+                0 if contact_point == "start" else len(connecting_sections) - 1
+            )
 
             # Process lane links
             for lane_link in connection.findall("laneLink"):
@@ -267,8 +335,12 @@ def process_junction_connections(
                     continue
 
                 # Construct unique lane IDs
-                from_unique = f"{incoming_road}_{from_lane_id}"
-                to_unique = f"{connecting_road}_{to_lane_id}"
+                from_unique = lane_unique_id(
+                    incoming_road, incoming_section_index, int(from_lane_id)
+                )
+                to_unique = lane_unique_id(
+                    connecting_road, connecting_section_index, int(to_lane_id)
+                )
 
                 if from_unique not in lane_geoms or to_unique not in lane_geoms:
                     continue

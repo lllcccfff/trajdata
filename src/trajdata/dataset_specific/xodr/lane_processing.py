@@ -11,12 +11,12 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 
-from .datatypes import LaneGeom
+from .datatypes import LaneGeom, lane_section_id, lane_unique_id
 from .geometry import (
     compute_polyline_from_width,
-    gather_lane_offsets_all_sections,
+    gather_lane_offsets,
     recompute_headings,
-    sample_centerline,
+    sample_centerline_with_s,
 )
 
 # Driveable lane types from OpenDRIVE spec
@@ -58,8 +58,10 @@ def process_road(
     road_id = road.attrib["id"]
     is_junction_road = road.attrib.get("junction", "-1") != "-1"
 
-    # Sample the road centerline
-    center_x, center_y, center_z, road_headings = sample_centerline(road, resolution)
+    # Sample the road reference line once, then split it at lane-section boundaries.
+    center_s, center_x, center_y, center_z, road_headings = sample_centerline_with_s(
+        road, resolution
+    )
     if center_x.size == 0:
         return min_xyz, max_xyz  # Nothing to do
 
@@ -70,54 +72,108 @@ def process_road(
     if lane_elem_lanes.find("laneSection") is None:
         return min_xyz, max_xyz
 
-    # Collect lane width polynomials across all laneSection elements
-    lane_offsets, lane_types, lane_directions = gather_lane_offsets_all_sections(
-        lane_elem_lanes
-    )
-
-    # Build width samples along s grid
-    s_grid = np.arange(center_x.shape[0]) * resolution
-
     # Apply lane offset to centerline
     center_x, center_y = _apply_lane_offset(
-        lane_elem_lanes, s_grid, center_x, center_y, road_headings
+        lane_elem_lanes, center_s, center_x, center_y, road_headings
     )
 
-    # Precompute widths per lane
-    lane_width_samples = _compute_lane_widths(lane_offsets, s_grid)
+    lane_sections = lane_elem_lanes.findall("laneSection")
+    road_length = float(road.attrib["length"])
+    for section_index, lane_section in enumerate(lane_sections):
+        section_s0 = float(lane_section.attrib.get("s", "0"))
+        section_s1 = (
+            float(lane_sections[section_index + 1].attrib["s"])
+            if section_index + 1 < len(lane_sections)
+            else road_length
+        )
+        section_s, section_x, section_y, section_z, section_headings = (
+            _slice_centerline(
+                center_s,
+                center_x,
+                center_y,
+                center_z,
+                road_headings,
+                section_s0,
+                section_s1,
+            )
+        )
+        lane_offsets, lane_types, lane_directions = gather_lane_offsets(lane_section)
+        lane_width_samples = _compute_lane_widths(
+            lane_offsets, section_s - section_s0
+        )
+        section_id = lane_section_id(road_id, section_index)
 
-    # Process all lanes to create geometry
-    _process_lane_geometry(
-        road_id,
-        lane_offsets,
-        lane_types,
-        lane_directions,
-        lane_width_samples,
-        center_x,
-        center_y,
-        center_z,
-        road_headings,
-        lane_geoms,
-        min_xyz,
-        max_xyz,
-        sidewalks,
-    )
-
-    # Extract and register road edges
-    _extract_road_edges(road_id, lane_offsets, lane_geoms, road_edges)
-
-    # Create artificial edges for non-junction roads
-    if not is_junction_road:
-        _create_artificial_edges(
+        _process_lane_geometry(
+            section_id,
             road_id,
+            section_index,
             lane_offsets,
-            center_x,
-            center_y,
-            road_headings,
-            road_edges,
+            lane_types,
+            lane_directions,
+            lane_width_samples,
+            section_x,
+            section_y,
+            section_z,
+            section_headings,
+            lane_geoms,
+            min_xyz,
+            max_xyz,
+            sidewalks,
         )
 
+        _extract_road_edges(section_id, lane_offsets, lane_geoms, road_edges)
+
+        if not is_junction_road:
+            _create_artificial_edges(
+                section_id,
+                lane_offsets,
+                section_x,
+                section_y,
+                section_headings,
+                road_edges,
+            )
+
     return min_xyz, max_xyz
+
+
+def _slice_centerline(
+    center_s: np.ndarray,
+    center_x: np.ndarray,
+    center_y: np.ndarray,
+    center_z: np.ndarray,
+    road_headings: np.ndarray,
+    section_s0: float,
+    section_s1: float,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    if section_s1 <= section_s0:
+        raise ValueError(
+            f"laneSection must have positive length, got [{section_s0}, {section_s1}]"
+        )
+
+    keep = np.concatenate(([True], np.diff(center_s) > 1e-9))
+    unique_s = center_s[keep]
+    if section_s0 < unique_s[0] or section_s1 > unique_s[-1] + 1e-6:
+        raise ValueError(
+            f"laneSection [{section_s0}, {section_s1}] is outside sampled road "
+            f"range [{unique_s[0]}, {unique_s[-1]}]"
+        )
+
+    interior = unique_s[(unique_s > section_s0) & (unique_s < section_s1)]
+    section_s = np.concatenate(([section_s0], interior, [section_s1]))
+
+    def interp(values: np.ndarray) -> np.ndarray:
+        return np.interp(section_s, unique_s, values[keep])
+
+    headings = np.unwrap(road_headings[keep])
+    section_headings = np.interp(section_s, unique_s, headings)
+    section_headings = np.arctan2(np.sin(section_headings), np.cos(section_headings))
+    return (
+        section_s,
+        interp(center_x),
+        interp(center_y),
+        interp(center_z),
+        section_headings,
+    )
 
 
 def _apply_lane_offset(
@@ -212,7 +268,9 @@ def _compute_lane_widths(
 
 
 def _process_lane_geometry(
-    road_id: str,
+    section_id: str,
+    xodr_road_id: str,
+    lane_section_index: int,
     lane_offsets: List[Tuple[int, List]],
     lane_types: Dict[int, str],
     lane_directions: Dict[int, str],
@@ -269,12 +327,20 @@ def _process_lane_geometry(
 
             lane_type = lane_types.get(lid, "none")
             lane_direction = lane_directions.get(lid, "standard")
+            if lane_direction != "standard":
+                raise ValueError(
+                    f"XODR lane {xodr_road_id}:{lane_section_index}:{lid} has "
+                    f"unsupported direction={lane_direction!r}; directed Road topology "
+                    "requires each RoadLane to have exactly one travel direction."
+                )
             is_driving = lane_type in DRIVEABLE_LANE_TYPES
             sign = 1 if lid > 0 else -1
 
             # Create lane geometry
             lane_geom = _create_single_lane_geometry(
-                road_id,
+                section_id,
+                xodr_road_id,
+                lane_section_index,
                 lid,
                 widths,
                 sign,
@@ -287,7 +353,7 @@ def _process_lane_geometry(
                 is_driving,
             )
 
-            unique_id = f"{road_id}_{lid}"
+            unique_id = lane_unique_id(xodr_road_id, lane_section_index, lid)
 
             # Handle sidewalks separately as PedWalkway elements
             if lane_type == "sidewalk" and sidewalks is not None:
@@ -318,7 +384,9 @@ def _process_lane_geometry(
 
 
 def _create_single_lane_geometry(
-    road_id: str,
+    section_id: str,
+    xodr_road_id: str,
+    lane_section_index: int,
     lane_id: int,
     widths: np.ndarray,
     sign: int,
@@ -373,12 +441,14 @@ def _create_single_lane_geometry(
 
     return LaneGeom(
         lane_id_xml=lane_id,
-        unique_id=f"{road_id}_{lane_id}",
+        unique_id=lane_unique_id(xodr_road_id, lane_section_index, lane_id),
         center=xyz_center,
         left_edge=xyz_left,
         right_edge=xyz_right,
         headings=lane_headings,
-        road_id=road_id,
+        road_id=section_id,
+        xodr_road_id=xodr_road_id,
+        lane_section_index=lane_section_index,
         lane_type=lane_type,
         is_driving=is_driving,
         is_left=lane_id > 0,
@@ -401,21 +471,33 @@ def _extract_road_edges(
         road_edges: Dictionary with road edges (updated in place)
     """
     # Extract edges from outermost lanes
-    left_lane_ids = [lid for lid, _ in lane_offsets if lid > 0]
-    right_lane_ids = [lid for lid, _ in lane_offsets if lid < 0]
+    left_lane_ids = [
+        lid
+        for lid, _ in lane_offsets
+        if lid > 0
+        and f"{road_id}:{lid}" in lane_geoms
+        and lane_geoms[f"{road_id}:{lid}"].is_driving
+    ]
+    right_lane_ids = [
+        lid
+        for lid, _ in lane_offsets
+        if lid < 0
+        and f"{road_id}:{lid}" in lane_geoms
+        and lane_geoms[f"{road_id}:{lid}"].is_driving
+    ]
 
     # Try to get edges from outermost lanes first
     if left_lane_ids:
         outermost_left = max(left_lane_ids)
-        outermost_id = f"{road_id}_{outermost_left}"
+        outermost_id = f"{road_id}:{outermost_left}"
         if outermost_id in lane_geoms:
             lg = lane_geoms[outermost_id]
-            if lg.left_edge is not None:
-                road_edges[f"{road_id}_L"] = lg.left_edge
+            if lg.right_edge is not None:
+                road_edges[f"{road_id}_L"] = lg.right_edge
 
     if right_lane_ids:
         outermost_right = min(right_lane_ids)
-        outermost_id = f"{road_id}_{outermost_right}"
+        outermost_id = f"{road_id}:{outermost_right}"
         if outermost_id in lane_geoms:
             lg = lane_geoms[outermost_id]
             if lg.right_edge is not None:
