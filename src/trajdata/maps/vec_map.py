@@ -74,6 +74,15 @@ class VectorMap:
                 for lane_id in road.lane_ids:
                     self.lane_to_road[lane_id] = road.id
 
+    @property
+    def location(self) -> str:
+        if not self.env_name.startswith("nusc"):
+            return "unknown"
+        location = self.map_name.split("-", 1)[0].lower()
+        if location in ("boston", "singapore"):
+            return location
+        return "unknown"
+
     @staticmethod
     def _lane_query_dim_for_map_id(map_id: str) -> int:
         env_name, _ = map_id.split(":")
@@ -90,6 +99,8 @@ class VectorMap:
                 self.lane_to_road[lane_id] = map_elem.id
 
     def compute_search_indices(self) -> None:
+        self.lanes = list(self.elements[MapElementType.ROAD_LANE].values())
+        self.roads = list(self.elements[MapElementType.ROAD].values())
         # TODO(bivanovic@nvidia.com): merge tree dicts?
         self.search_kdtrees = {MapElementType.ROAD_LANE: LaneCenterKDTree(self)}
         self.search_rtrees = {
