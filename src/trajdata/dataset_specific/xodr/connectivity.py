@@ -296,6 +296,10 @@ def process_junction_connections(
     for junction in root.findall("junction"):
         junction_id = junction.attrib["id"]
         for connection in junction.findall("connection"):
+            lane_links = connection.findall("laneLink")
+            if not lane_links:
+                continue
+
             incoming_road = connection.attrib.get("incomingRoad")
             connecting_road = connection.attrib.get("connectingRoad")
             contact_point = connection.attrib.get("contactPoint", "start")
@@ -327,7 +331,7 @@ def process_junction_connections(
             )
 
             # Process lane links
-            for lane_link in connection.findall("laneLink"):
+            for lane_link in lane_links:
                 from_lane_id = lane_link.attrib.get("from")
                 to_lane_id = lane_link.attrib.get("to")
 
